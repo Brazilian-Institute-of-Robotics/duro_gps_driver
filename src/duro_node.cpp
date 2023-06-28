@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
 #include <cmath>
 #include <memory>
 
@@ -37,6 +38,7 @@
 // include folder headers
 #include "duro_gps_driver/UTM.h"
 #include "duro_gps_driver/fake_orientation.hpp"
+#include "duro_gps_driver/srv/auto_survey.hpp"
 
 rclcpp::Node::SharedPtr node;
 // Publishers
@@ -51,6 +53,9 @@ rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr fake_pub;
 rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr status_flag_pub;
 rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_string_pub;
 rclcpp::Publisher<sensor_msgs::msg::TimeReference>::SharedPtr time_ref_pub;
+
+// Servers
+rclcpp::Service<duro_gps_driver::srv::AutoSurvey>::SharedPtr auto_survey_srv;
 
 // ROS msgs
 sensor_msgs::msg::NavSatFix navsatfix_msg;
@@ -79,6 +84,8 @@ std::string tf_frame_id, tf_child_frame_id;
 bool euler_based_orientation;
 bool zero_based_pose;
 float z_coord_exact_height;
+int num_auto_survey_readings;
+bool debug;
 
 // SBP variables
 static sbp_msg_callbacks_node_t pos_ll_callback_node;
@@ -101,6 +108,9 @@ bool first_run_z_coord = true;
 bool first_run_pose = true;
 double z_coord_start = 0.0;
 geometry_msgs::msg::PoseStamped start_pose;
+std::vector<double> lat_buffer;
+std::vector<double> lon_buffer;
+std::vector<double> height_buffer;
 
 void setup_socket()
 {
@@ -189,6 +199,26 @@ void pos_ll_callback(u16 sender_id, u8 len, u8 msg[], void *context)
     navsatfix_msg.position_covariance[4] = h_covariance;                  // y = 1, 1
     navsatfix_msg.position_covariance[8] = v_covariance;                  // z = 2, 2
     navsatfix_msg.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+
+	// Update buffers
+	if(lat_buffer.size() < num_auto_survey_readings)
+	{
+		lat_buffer.push_back(latlonmsg->lat);
+		lon_buffer.push_back(latlonmsg->lon);
+		height_buffer.push_back(latlonmsg->height);
+    if (debug)
+      RCLCPP_INFO(node->get_logger(), "Got %d msgs", lat_buffer.size());
+	} else {
+    RCLCPP_INFO_ONCE(node->get_logger(), "All LLH buffers are full!", lat_buffer.size());
+		lat_buffer.erase(lat_buffer.begin());
+		lat_buffer.push_back(latlonmsg->lat);
+
+		lon_buffer.erase(lon_buffer.begin());
+		lon_buffer.push_back(latlonmsg->lat);
+
+		height_buffer.erase(height_buffer.begin());
+		height_buffer.push_back(latlonmsg->lat);
+	}
 
     double x = 0, y = 0;
     coordinate_transition.LatLonToUTMXY(latlonmsg->lat, latlonmsg->lon, x, y);
@@ -507,6 +537,100 @@ s32 socket_read(u8 *buff, u32 n, void *context)
   return read(socket_desc, buff, n);
 }
 
+s32 socket_write(u8 *buff, u32 n, void *context)
+{
+	return write(socket_desc, buff, n);
+}
+
+int ReplacePipeWithNull( char *c )
+{
+   char *p = c;
+
+   // Replace '|' with null character per SBP specification
+   while ( *p )
+   {
+      if ( '|' == *p )
+      {
+         *p = '\0';
+      }
+      p++;
+   } // while()
+
+   return p - c + 1; // Include original string null terminator in length output
+
+} // ReplacePipeWithNull()
+
+void auto_survey_callback(
+	const duro_gps_driver::srv::AutoSurvey::Request::SharedPtr request,
+	const duro_gps_driver::srv::AutoSurvey::Response::SharedPtr response)
+{
+	// Get mean value of LLH and fill response msg
+	double sum = 0.0;
+
+	if (lat_buffer.size() < num_auto_survey_readings) {
+		RCLCPP_WARN(node->get_logger(), "Latitude readings are below 'num_auto_survey_readings'");
+	}
+	for(int i=0; i< lat_buffer.size(); i++) {
+		sum += lat_buffer.at(i);
+	}
+	response->latitude = sum / lat_buffer.size();
+
+	if (lon_buffer.size() < num_auto_survey_readings) {
+		RCLCPP_WARN(node->get_logger(), "Longitude readings are below 'num_auto_survey_readings'");
+	}
+	sum = 0.0;
+	for(int i=0; i< lon_buffer.size(); i++) {
+		sum += lon_buffer.at(i);
+	}
+	response->longitude = sum / lon_buffer.size();
+
+	if (height_buffer.size() < num_auto_survey_readings) {
+		RCLCPP_WARN(node->get_logger(), "Altitude readings are below 'num_auto_survey_readings'");
+	}
+	sum = 0.0;
+	for(int i=0; i< height_buffer.size(); i++) {
+		sum += height_buffer.at(i);
+	}
+	response->altitude = sum / height_buffer.size();
+
+	// Write surveyed position to device
+	char msg[100];
+	int  msg_len;
+
+	snprintf(msg, sizeof(msg), "surveyed_position|surveyed_lat|%.10f", response->latitude);
+	msg_len = ReplacePipeWithNull(msg);
+	auto send_status = sbp_payload_send(&sbp_state, SBP_MSG_SETTINGS_WRITE, 0x42, msg_len, (u8*)&msg, socket_write);
+	if (send_status != SBP_OK) {
+		RCLCPP_ERROR(node->get_logger(), "Unable to write surveyed latitude to device");
+		response->write_status = (int)send_status;
+		return;
+	}
+
+	snprintf(msg, sizeof(msg), "surveyed_position|surveyed_lon|%.10f", response->longitude);
+	msg_len = ReplacePipeWithNull(msg);
+	send_status = sbp_payload_send(&sbp_state, SBP_MSG_SETTINGS_WRITE, 0x42, msg_len, (u8*)&msg, socket_write);
+	if (send_status != SBP_OK) {
+		RCLCPP_ERROR(node->get_logger(), "Unable to write surveyed longitude to device");
+		response->write_status = (int)send_status;
+		return;
+	}
+
+	snprintf(msg, sizeof(msg), "surveyed_position|surveyed_alt|%.10f", response->altitude);
+	msg_len = ReplacePipeWithNull(msg);
+	send_status = sbp_payload_send(&sbp_state, SBP_MSG_SETTINGS_WRITE, 0x42, msg_len, (u8*)&msg, socket_write);
+	if (send_status != SBP_OK) {
+		RCLCPP_ERROR(node->get_logger(), "Unable to write surveyed altitude to device");
+		response->write_status = (int)send_status;
+		return;
+	}
+
+	RCLCPP_INFO(node->get_logger(), 
+		"Auto Survey was successful!\nLatitude:  %.10f\nLongitude:  %.10f\nAltitude:  %.10f\n",
+		response->latitude,
+		response->longitude,
+		response->altitude);
+}
+
 
 int main(int argc, char * argv[])
 {
@@ -527,6 +651,10 @@ int main(int argc, char * argv[])
   tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(node);
 
 
+  auto_survey_srv = node->create_service<duro_gps_driver::srv::AutoSurvey>(
+	"auto_survey", auto_survey_callback);
+
+
   node->declare_parameter<std::string>("ip_address", "192.168.0.222");
   node->declare_parameter<int>("port", 55555);
   node->declare_parameter<std::string>("gps_receiver_frame", "duro");
@@ -539,6 +667,8 @@ int main(int argc, char * argv[])
   node->declare_parameter<std::string>("tf_frame_id", "map");
   node->declare_parameter<std::string>("tf_child_frame_id", "gps");
   node->declare_parameter<bool>("zero_based_pose", false);
+  node->declare_parameter<int>("num_auto_survey_readings", 1000);
+  node->declare_parameter<bool>("debug", false);
   
 
   node->get_parameter("ip_address", tcp_ip_addr);
@@ -550,9 +680,11 @@ int main(int argc, char * argv[])
   node->get_parameter("z_coord_ref_switch", z_coord_ref_switch);
   node->get_parameter("z_coord_exact_height", z_coord_exact_height);
   node->get_parameter("euler_based_orientation", euler_based_orientation);
-  node->get_parameter("tf_frame_id", tf_frame_id); 
-  node->get_parameter("tf_child_frame_id", tf_child_frame_id); 
-  node->get_parameter("zero_based_pose", zero_based_pose); 
+  node->get_parameter("tf_frame_id", tf_frame_id);
+  node->get_parameter("tf_child_frame_id", tf_child_frame_id);
+  node->get_parameter("zero_based_pose", zero_based_pose);
+  node->get_parameter("num_auto_survey_readings", num_auto_survey_readings);
+  node->get_parameter("debug", debug);
   
 
   RCLCPP_INFO(node->get_logger(), "Starting GPS Duro...");

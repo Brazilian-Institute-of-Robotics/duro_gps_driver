@@ -14,6 +14,15 @@ find_package(tf2 REQUIRED)
 find_package(tf2_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/AutoSurvey.srv"
+  DEPENDENCIES std_msgs
+)
+
+ament_export_dependencies(rosidl_default_runtime)
+
 
 include_directories(
   include 
@@ -29,14 +38,18 @@ set(ament_dependencies
   tf2_msgs
   tf2_ros
   tf2_geometry_msgs
-)
-link_directories("/usr/local/lib/")
+  )
+  link_directories("/usr/local/lib/")
 include_directories("/usr/local/include/")
 
 add_executable(duro_node src/duro_node.cpp src/utm.cpp src/fake_orientation.cpp)
 
 ament_target_dependencies(duro_node ${ament_dependencies})
 target_link_libraries(duro_node sbp)
+
+rosidl_target_interfaces(duro_node
+  ${PROJECT_NAME} "rosidl_typesupport_cpp"
+)
 
 ## Install
 ## Mark executables and/or libraries for installation
